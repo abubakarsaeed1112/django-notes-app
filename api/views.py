@@ -31,16 +31,17 @@ def getRoutes(request):
             'Endpoint': '/notes/id/update/',
             'method': 'PUT',
             'body': {'body': ""},
-            'description': 'Creates an existing note with data sent in post request'
+            'description': 'Updates an existing note'
         },
         {
             'Endpoint': '/notes/id/delete/',
             'method': 'DELETE',
             'body': None,
-            'description': 'Deletes and exiting note'
+            'description': 'Deletes an existing note'
         },
     ]
     return Response(routes)
+
 
 @api_view(['GET'])
 def getNotes(request):
@@ -48,11 +49,13 @@ def getNotes(request):
     serializer = NoteSerializer(notes, many=True)
     return Response(serializer.data)
 
+
 @api_view(['GET'])
 def getNote(request, pk):
     note = Note.objects.get(id=pk)
     serializer = NoteSerializer(note, many=False)
     return Response(serializer.data)
+
 
 @api_view(['PUT'])
 def updateNote(request, pk):
@@ -62,17 +65,19 @@ def updateNote(request, pk):
         serializer.save()
     return Response(serializer.data)
 
+
 @api_view(['DELETE'])
 def deleteNote(request, pk):
     note = Note.objects.get(id=pk)
     note.delete()
     return Response('Note was deleted!')
 
+
 @api_view(['POST'])
 def createNote(request):
     data = request.data
     note = Note.objects.create(
-        body=data['body']
+        body=data.get('body', '')  # fixed: avoid KeyError if body missing
     )
     serializer = NoteSerializer(note, many=False)
     return Response(serializer.data)
