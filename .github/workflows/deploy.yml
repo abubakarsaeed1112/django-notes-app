@@ -1,0 +1,145 @@
+name: Deploy to EC2 via ECR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: django-notes-app-prod
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: vars
+        run: echo "IMAGE_TAG=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build and push app image
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          APP_DIR: ${{ secrets.APP_DIR }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,AWS_REGION,APP_DIR
+          script: |
+            set -e
+
+            mkdir -p $APP_DIR
+            cd $APP_DIR
+
+            if [ ! -d .git ]; then
+              git clone https://github.com/${{ github.repository }} .
+            else
+              git fetch --all
+              git reset --hard origin/main
+            fi
+
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            cat > docker-compose.prod.yml <<EOF
+            services:
+              nginx:
+                build: ./nginx
+                image: nginx:local
+                container_name: nginx_cont
+                ports:
+                  - "80:80"
+                restart: always
+                depends_on:
+                  django_app:
+                    condition: service_healthy
+                networks:
+                  - notes-app-nw
+
+              django_app:
+                image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+                container_name: django_cont
+                ports:
+                  - "8000:8000"
+                command: >
+                  sh -c "
+                  sleep 20;
+                  python manage.py migrate --noinput &&
+                  gunicorn notesapp.wsgi:application --bind 0.0.0.0:8000
+                  "
+                env_file:
+                  - .env
+                depends_on:
+                  db:
+                    condition: service_healthy
+                restart: always
+                healthcheck:
+                  test: ["CMD-SHELL", "curl -f http://localhost:8000/admin || exit 1"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 5
+                  start_period: 40s
+                networks:
+                  - notes-app-nw
+
+              db:
+                image: mysql:8.0
+                container_name: db_cont
+                environment:
+                  MYSQL_ROOT_PASSWORD: root
+                  MYSQL_DATABASE: test_db
+                volumes:
+                  - ./data/mysql/db:/var/lib/mysql
+                healthcheck:
+                  test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot --silent"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 10
+                  start_period: 40s
+                restart: always
+                networks:
+                  - notes-app-nw
+
+            networks:
+              notes-app-nw:
+            EOF
+
+            docker compose -f docker-compose.prod.yml down || true
+            docker compose -f docker-compose.prod.yml pull django_app || true
+            docker compose -f docker-compose.prod.yml up -d --build
+
+            docker image prune -af
